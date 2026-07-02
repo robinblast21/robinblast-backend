@@ -3,6 +3,7 @@ const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 require("dotenv").config();
+const { refundRoomOnChain, settleRoundOnChain } = require("./blockchain");
 
 const app = express();
 app.use(cors());
@@ -34,13 +35,20 @@ function createRoom(roomId, roomType, entryFee) {
   };
 }
 
-function handleWaitingTimeout(roomId) {
+async function handleWaitingTimeout(roomId) {
   const room = rooms[roomId];
   if (!room || room.status !== "waiting") return;
 
   if (room.players.length < 2) {
     console.log(`Room ${roomId} did not fill up — refunding players`);
     io.to(room.id).emit("room_refunded", { roomId: room.id });
+
+    try {
+      await refundRoomOnChain(roomId);
+    } catch (err) {
+      console.error(`On-chain refund failed for room ${roomId}:`, err.message);
+    }
+
     delete rooms[roomId];
   } else {
     startGame(room);
@@ -77,9 +85,7 @@ function explodeBomb(room) {
   const victim = room.players.find((p) => p.socketId === room.bombHolderId);
   if (!victim) return;
   eliminatePlayer(room, victim, "exploded");
-}
-
-function eliminatePlayer(room, player, reason) {
+}function eliminatePlayer(room, player, reason) {
   player.alive = false;
   const survivors = room.players.filter((p) => p.alive);
 
@@ -97,14 +103,25 @@ function eliminatePlayer(room, player, reason) {
   }
 }
 
-function finishGame(room, winner) {
+async function finishGame(room, winner) {
   room.status = "finished";
+
   io.to(room.id).emit("game_finished", {
     roomId: room.id,
     winnerId: winner ? winner.socketId : null,
     winnerWallet: winner ? winner.walletAddress : null,
   });
+
   console.log(`Room ${room.id} finished. Winner: ${winner ? winner.walletAddress : "none"}`);
+
+  if (winner) {
+    try {
+      await settleRoundOnChain(room.id, winner.walletAddress);
+    } catch (err) {
+      console.error(`On-chain settlement failed for room ${room.id}:`, err.message);
+    }
+  }
+
   clearTimeout(room.explodeTimer);
   delete rooms[room.id];
 }
@@ -115,7 +132,9 @@ function findPlayerRoom(socketId) {
     if (player) return { room, player };
   }
   return null;
-}io.on("connection", (socket) => {
+}
+
+io.on("connection", (socket) => {
   console.log("A player connected:", socket.id);
 
   socket.on("join_room", ({ roomType, walletAddress }) => {
@@ -152,9 +171,7 @@ function findPlayerRoom(socketId) {
         handleWaitingTimeout(room.id);
       }, 60 * 1000);
     }
-  });
-
-  socket.on("rejoin_room", ({ roomId, oldSocketId }) => {
+  });socket.on("rejoin_room", ({ roomId, oldSocketId }) => {
     const room = rooms[roomId];
     if (!room) {
       socket.emit("rejoin_failed", { reason: "Room no longer exists" });
@@ -246,4 +263,4 @@ function findPlayerRoom(socketId) {
 const PORT = process.env.PORT || 3003;
 server.listen(PORT, () => {
   console.log(`RobinBlast backend listening on port ${PORT}`);
-});0
+});
