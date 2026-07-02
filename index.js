@@ -1,6 +1,3 @@
-// index.js
-// Entry point for the RobinBlast backend server
-
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
@@ -14,32 +11,29 @@ app.use(express.json());
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-  },
+  cors: { origin: "*" },
 });
 
 app.get("/", (req, res) => {
   res.json({ status: "RobinBlast backend is running" });
 });
 
-// In-memory storage for rooms
 const rooms = {};
+const GRACE_PERIOD_MS = 30 * 1000;
 
 function createRoom(roomId, roomType, entryFee) {
   return {
     id: roomId,
     type: roomType,
     entryFee: entryFee,
-    players: [],           // { socketId, walletAddress, alive }
-    status: "waiting",     // "waiting" | "playing" | "finished"
+    players: [],
+    status: "waiting",
     waitingTimer: null,
-    bombHolderId: null,    // socketId of whoever currently has the bomb
+    bombHolderId: null,
     explodeTimer: null,
   };
 }
 
-// Called 60 seconds after the first player joins a waiting room
 function handleWaitingTimeout(roomId) {
   const room = rooms[roomId];
   if (!room || room.status !== "waiting") return;
@@ -53,84 +47,75 @@ function handleWaitingTimeout(roomId) {
   }
 }
 
-// Kicks off the actual bomb game once a room has enough players
 function startGame(room) {
   room.status = "playing";
   room.players.forEach((p) => (p.alive = true));
-
-  io.to(room.id).emit("game_start", {
-    roomId: room.id,
-    players: room.players,
-  });
-
+  io.to(room.id).emit("game_start", { roomId: room.id, players: room.players });
   assignBombToRandomPlayer(room);
 }
 
-// Picks a random living player to hold the bomb, and starts a hidden countdown
 function assignBombToRandomPlayer(room) {
   const alivePlayers = room.players.filter((p) => p.alive);
+  if (alivePlayers.length === 0) return;
+
   const chosen = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
   room.bombHolderId = chosen.socketId;
 
-  // Tell everyone who holds the bomb now — but NOT when it will explode.
-  // The explosion timing is only known to the server.
   io.to(room.id).emit("bomb_assigned", {
     roomId: room.id,
     bombHolderId: chosen.socketId,
   });
 
-  // Random explosion delay between 15 and 45 seconds
   const delay = (Math.floor(Math.random() * 30) + 15) * 1000;
-
   clearTimeout(room.explodeTimer);
   room.explodeTimer = setTimeout(() => {
     explodeBomb(room);
   }, delay);
 }
 
-// Called when the hidden timer runs out — whoever holds the bomb is eliminated
 function explodeBomb(room) {
   const victim = room.players.find((p) => p.socketId === room.bombHolderId);
   if (!victim) return;
+  eliminatePlayer(room, victim, "exploded");
+}
 
-  victim.alive = false;
-
+function eliminatePlayer(room, player, reason) {
+  player.alive = false;
   const survivors = room.players.filter((p) => p.alive);
 
   io.to(room.id).emit("bomb_exploded", {
     roomId: room.id,
-    eliminatedId: victim.socketId,
+    eliminatedId: player.socketId,
+    reason,
     survivorsRemaining: survivors.length,
   });
 
   if (survivors.length <= 1) {
     finishGame(room, survivors[0] || null);
-  } else {
-    // Continue the game with the remaining players
+  } else if (room.bombHolderId === player.socketId) {
     assignBombToRandomPlayer(room);
   }
 }
 
-// Called when only one player (or zero) remains
 function finishGame(room, winner) {
   room.status = "finished";
-
   io.to(room.id).emit("game_finished", {
     roomId: room.id,
     winnerId: winner ? winner.socketId : null,
     winnerWallet: winner ? winner.walletAddress : null,
   });
-
-  console.log(
-    `Room ${room.id} finished. Winner: ${winner ? winner.walletAddress : "none"}`
-  );
-
-  // Clean up — this room's job is done
+  console.log(`Room ${room.id} finished. Winner: ${winner ? winner.walletAddress : "none"}`);
   clearTimeout(room.explodeTimer);
   delete rooms[room.id];
 }
 
-io.on("connection", (socket) => {
+function findPlayerRoom(socketId) {
+  for (const room of Object.values(rooms)) {
+    const player = room.players.find((p) => p.socketId === socketId);
+    if (player) return { room, player };
+  }
+  return null;
+}io.on("connection", (socket) => {
   console.log("A player connected:", socket.id);
 
   socket.on("join_room", ({ roomType, walletAddress }) => {
@@ -145,7 +130,13 @@ io.on("connection", (socket) => {
       rooms[roomId] = room;
     }
 
-    room.players.push({ socketId: socket.id, walletAddress, alive: true });
+    room.players.push({
+      socketId: socket.id,
+      walletAddress,
+      alive: true,
+      connected: true,
+      disconnectTimer: null,
+    });
     socket.join(room.id);
 
     console.log(`Player ${socket.id} joined room ${room.id} (${room.players.length} players)`);
@@ -163,12 +154,42 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Player taps another player to pass the bomb to them
+  socket.on("rejoin_room", ({ roomId, oldSocketId }) => {
+    const room = rooms[roomId];
+    if (!room) {
+      socket.emit("rejoin_failed", { reason: "Room no longer exists" });
+      return;
+    }
+
+    const player = room.players.find((p) => p.socketId === oldSocketId);
+    if (!player) {
+      socket.emit("rejoin_failed", { reason: "Player not found in room" });
+      return;
+    }
+
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
+    player.connected = true;
+
+    if (room.bombHolderId === oldSocketId) {
+      room.bombHolderId = socket.id;
+    }
+    player.socketId = socket.id;
+    socket.join(room.id);
+
+    console.log(`Player reconnected to room ${room.id}`);
+
+    io.to(room.id).emit("room_update", {
+      roomId: room.id,
+      players: room.players,
+      status: room.status,
+    });
+    socket.emit("rejoin_success", { roomId: room.id, status: room.status });
+  });
+
   socket.on("pass_bomb", ({ roomId, targetSocketId }) => {
     const room = rooms[roomId];
     if (!room || room.status !== "playing") return;
-
-    // Only the current bomb holder is allowed to pass it
     if (room.bombHolderId !== socket.id) return;
 
     const target = room.players.find(
@@ -183,13 +204,42 @@ io.on("connection", (socket) => {
       fromId: socket.id,
       toId: target.socketId,
     });
-    // Note: the explosion timer keeps running in the background —
-    // passing the bomb does NOT reset or extend it.
   });
 
   socket.on("disconnect", () => {
     console.log("A player disconnected:", socket.id);
-    // TODO: handle a player disconnecting mid-game
+
+    const found = findPlayerRoom(socket.id);
+    if (!found) return;
+
+    const { room, player } = found;
+    player.connected = false;
+
+    if (room.status === "waiting") {
+      room.players = room.players.filter((p) => p.socketId !== socket.id);
+      io.to(room.id).emit("room_update", {
+        roomId: room.id,
+        players: room.players,
+        status: room.status,
+      });
+      return;
+    }
+
+    if (room.status === "playing" && room.bombHolderId === socket.id) {
+      const alivePlayers = room.players.filter(
+        (p) => p.alive && p.socketId !== socket.id
+      );
+      if (alivePlayers.length > 0) {
+        assignBombToRandomPlayer(room);
+      }
+    }
+
+    player.disconnectTimer = setTimeout(() => {
+      if (!player.connected && player.alive) {
+        console.log(`Player ${socket.id} did not reconnect in time — forfeiting`);
+        eliminatePlayer(room, player, "forfeit");
+      }
+    }, GRACE_PERIOD_MS);
   });
 });
 
